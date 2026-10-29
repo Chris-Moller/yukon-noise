@@ -3775,11 +3775,11 @@ MODEL = None
 
 class IdentityPhase:
     """The identity-path phase of a run: built, compiled and captured (CUDA graphs) on random tokens when constructed,
-    then reset to its fresh state on the real batches; `run()` is the timed part. `rows` are the training rows (numpy
-    [n, 2049]); the phase trains on the first `updates` x BATCH rows of the order permutation(n) under rng (ID_SEED + 1, 0)
-    (`used_rows()`), so a later phase can leave them out."""
+    then reset to its fresh state; `load()` puts the real batches in, and `run()` is the timed part. Of the `n`
+    training rows, the phase trains on the first `updates` x BATCH rows of the order permutation(n) under rng
+    (ID_SEED + 1, 0) (`used_rows()`), so a later phase can leave them out."""
 
-    def __init__(self, rows, updates, device, rank, world, seed=ID_SEED, start=True, ema=True, skip=True):
+    def __init__(self, n, updates, device, rank, world, seed=ID_SEED, start=True, ema=True, skip=True):
         global STEPS, WARMUP_UNTIL, COOLDOWN, ID_SEED, START, EMA, SKIP, MODEL
         STEPS, WARMUP_UNTIL, COOLDOWN, ID_SEED = updates, updates * 4 // 5, updates * 2 // 5, seed
         START, EMA, SKIP = start, ema, skip
@@ -3787,9 +3787,7 @@ class IdentityPhase:
             raise SystemExit(f'one head per GPU: run on {H} GPUs, not {world}')
         torch.backends.cuda.matmul.allow_tf32 = True
         self.rank, self.updates = rank, updates
-        self.order = np.random.default_rng((ID_SEED + 1, 0)).permutation(len(rows))
-        batches = np.stack([rows[np.sort(self.order[i:i + BATCH])]
-                            for i in range(0, len(rows) - BATCH + 1, BATCH)][:STEPS])
+        self.order = np.random.default_rng((ID_SEED + 1, 0)).permutation(n)
         model = self.model = MODEL = Model(device, rank, world)
         snapshot = [x.clone() for x in model.tensors()]
         graphs = self.graphs = {}
@@ -3809,15 +3807,22 @@ class IdentityPhase:
                     with torch.cuda.graph(g):
                         update(model, length, skip_blocks)
                     graphs[length, update is average_step, bool(skip_blocks)] = g
-        with torch.no_grad():  # training starts from the untouched state, on the real batches
+        with torch.no_grad():  # training starts from the untouched state
             for x, s in zip(model.tensors(), snapshot):
                 x.copy_(s)
             model.cast_all()
-            model.rows.copy_(torch.from_numpy(batches.astype(np.int64)))
             model.step_t.zero_()
             model.losses.zero_()
         torch.cuda.synchronize()
         dist.barrier()
+
+    def load(self, rows):
+        """The real batches into the captured graphs' input: `rows` are the training rows (numpy [n, 2049])."""
+        batches = np.stack([rows[np.sort(self.order[i:i + BATCH])]
+                            for i in range(0, len(rows) - BATCH + 1, BATCH)][:STEPS])
+        with torch.no_grad():
+            self.model.rows.copy_(torch.from_numpy(batches.astype(np.int64)))
+        torch.cuda.synchronize()
 
     def used_rows(self):
         """Indices of the training rows this phase consumes."""
@@ -3864,25 +3869,26 @@ def train_stages(args, settings, device, rank, world):
     """Boost -> own-query Cut; each row is consumed exactly once, including across resume."""
     if world not in (1, 2, 4, 8):
         raise ValueError('Stage training supports 1, 2, 4 or 8 GPUs')
-    # On Yukon the clock starts here, when the training data first becomes readable.
-    training = load_rows(noise_harness.training_data(local=args.data_dir / 'train.pt'), TRAIN_ROWS)
+    # Everything before the timer needs the training rows' count and order, not their tokens: it runs on the rows'
+    # indices, and the tokens are read last, just before the timer (on Yukon, reading them starts the clock).
+    rows = torch.arange(TRAIN_ROWS)
     identity = None
     if args.identity_updates and not args.resume:  # the identity-path phase, built and captured before the timer
-        identity = IdentityPhase(training.numpy(), args.identity_schedule or args.identity_updates, device, rank, world,
+        identity = IdentityPhase(len(rows), args.identity_schedule or args.identity_updates, device, rank, world,
                                  seed=SEED)
     if args.identity_updates:  # its rows feed no Cut update: one epoch over both phases
         import numpy as np
-        used = np.random.default_rng((SEED + 1, 0)).permutation(len(training))[:args.identity_updates * 8]
-        keep = torch.ones(len(training), dtype=torch.bool)
+        used = np.random.default_rng((SEED + 1, 0)).permutation(len(rows))[:args.identity_updates * 8]
+        keep = torch.ones(len(rows), dtype=torch.bool)
         keep[torch.from_numpy(used)] = False
-        training = training[keep]
-    training = training[torch.randperm(len(training), generator=torch.Generator().manual_seed(SEED + 1))]
-    holdout_rows, training = training[-HOLDOUT:], training[:-HOLDOUT]  # these feed no update, only the end merge
+        rows = rows[keep]
+    rows = rows[torch.randperm(len(rows), generator=torch.Generator().manual_seed(SEED + 1))]
+    holdout_index, training_index = rows[-HOLDOUT:], rows[:-HOLDOUT]  # the held-out rows feed no update, only the merge
     means = None  # the exponential means of the end merge, one per MERGE_DECAYS entry
     global MERGE_FIRST_KEYS, MERGE_GRAPH
     MERGE_FIRST_KEYS = settings.merge_keys
     MERGE_GRAPH = settings.merge_graph
-    schedule = stage_schedule(len(training), settings)
+    schedule = stage_schedule(len(training_index), settings)
     steps = min(args.steps or len(schedule), len(schedule))
     stop = min(steps, args.stop_after_step or steps)
     split = max(1, world // settings.boost_batch)
@@ -3901,7 +3907,7 @@ def train_stages(args, settings, device, rank, world):
         args.output.mkdir(parents=True, exist_ok=True)
         (args.output / 'config.json').write_text(json.dumps(dict(
             script=__file__, world=world, seed=SEED, recipe=recipe_state, steps=steps,
-            epoch_updates=len(schedule), train_rows=len(training),
+            epoch_updates=len(schedule), train_rows=len(training_index),
             upstream='qlabs-eng/noise@98dbf6339c7768b2a6c2b9022aa25c80eb22a259',
             additions=['linear_path_scalars', 'input_key_probes', 'input_gate_probes',
                        'independent_future_hidden_query_embedding_probes', 'cut_batch4_split2', 'recipe_11',
@@ -3958,6 +3964,11 @@ def train_stages(args, settings, device, rank, world):
         for _ in range(3):
             holdout_loss(model, torch.randint(0, settings.model.vocab_size, (HOLDOUT, settings.model.sequence_len + 1),
                                               generator=torch.Generator().manual_seed(SEED + 2)), rank, world)
+    # On Yukon the clock starts here, when the training data first becomes readable.
+    training = load_rows(noise_harness.training_data(local=args.data_dir / 'train.pt'), TRAIN_ROWS)
+    if identity is not None:
+        identity.load(training.numpy())
+    holdout_rows, training = training[holdout_index], training[training_index]
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     start, paused, elapsed = time.perf_counter(), 0., previous_seconds
