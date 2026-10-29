@@ -112,6 +112,9 @@ class Requests(socketserver.StreamRequestHandler):
 
 class Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
+    # Every rank asks for the data at the same moment. The default backlog (5) is smaller than a node's ranks,
+    # and gVisor fails a connect to a full backlog at once rather than waiting.
+    request_queue_size = 128
 
     def __init__(self, path: Path, run: Run):
         super().__init__(str(path), Requests)

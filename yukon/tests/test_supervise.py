@@ -84,6 +84,17 @@ class Supervisor(unittest.TestCase):
         self.assertEqual((record['outcome'], record['exitCode']), ('exited', 3))
         self.assertEqual(result.returncode, 1)
 
+    def test_every_rank_can_ask_for_the_data_at_once(self):
+        result, record = self.supervise("""
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(32) as ranks:
+                paths = set(ranks.map(lambda _: noise_harness.training_data(local=Path('unused')), range(32)))
+            Path('final.pt').write_bytes(b'weights')
+            noise_harness.submit(Path('final.pt'))
+        """)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(record['outcome'], 'submitted')
+
     def test_a_run_that_never_submits_fails(self):
         result, record = self.supervise("noise_harness.training_data(local=Path('unused'))\n")
         self.assertEqual((record['outcome'], record['exitCode']), ('exited', 0))
