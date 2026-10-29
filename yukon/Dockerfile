@@ -17,7 +17,6 @@ FROM python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb06
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc g++ libc6-dev procps util-linux \
  && rm -rf /var/lib/apt/lists/*
-COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_PROJECT_ENVIRONMENT=/opt/noise/venv \
     UV_PYTHON=/usr/local/bin/python3.12 \
     UV_LINK_MODE=copy \
@@ -25,7 +24,9 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/noise/venv \
     PATH=/opt/noise/venv/bin:$PATH
 WORKDIR /opt/noise/repo
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project && rm /usr/local/bin/uv
+# uv and its download cache are mounted for this step only: the image holds the environment alone.
+RUN --mount=from=uv,source=/uv,target=/bin/uv --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project
 COPY utils/ utils/
 COPY tokenizer/ tokenizer/
 
