@@ -31,7 +31,10 @@ COPY utils/ utils/
 COPY tokenizer/ tokenizer/
 
 FROM stack AS data
-RUN python utils/prepare_data.py
+# prepare_data.py can abort in its own teardown after writing correct files (a streaming thread at
+# exit), so its exit code does not decide: load_rows checks both files against the pinned hashes.
+RUN python utils/prepare_data.py; \
+    python -c "from utils.prepare_data import TRAIN_ROWS, VAL_ROWS, load_rows; load_rows('data/train.pt', TRAIN_ROWS); load_rows('data/val.pt', VAL_ROWS)"
 
 FROM stack AS participant
 RUN useradd --create-home --uid 1000 participant
