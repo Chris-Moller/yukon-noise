@@ -1,0 +1,7 @@
+# yukon/Dockerfile copies only what the images need; keep the rest out of the build context.
+.git
+**/__pycache__
+archive
+data
+logs
+*.gif

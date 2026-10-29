@@ -81,6 +81,7 @@ from torch.nn.attention.flex_attention import AuxRequest, create_block_mask, fle
 from utils.model import GPT, GPTConfig, apply_rotary_emb, attention, flex, has_ve, norm, window_mask
 from utils.prepare_data import TRAIN_ROWS, load_rows
 from utils.eval import evaluate
+from yukon.harness import noise_harness
 
 SEED = 0
 IDENTITY_UPDATES, IDENTITY_SCHEDULE = 660, 1831  # the identity-path phase: updates run of its planned schedule
@@ -3854,11 +3855,17 @@ class IdentityPhase:
 
 
 
+def validation_loss(state, data_dir):
+    """Where the validation set exists: locally, never on Yukon, where only the verifier has it."""
+    return evaluate(state, data_dir) if (data_dir / 'val.pt').exists() else None
+
+
 def train_stages(args, settings, device, rank, world):
     """Boost -> own-query Cut; each row is consumed exactly once, including across resume."""
     if world not in (1, 2, 4, 8):
         raise ValueError('Stage training supports 1, 2, 4 or 8 GPUs')
-    training = load_rows(args.data_dir / 'train.pt', TRAIN_ROWS)
+    # On Yukon the clock starts here, when the training data first becomes readable.
+    training = load_rows(noise_harness.training_data(local=args.data_dir / 'train.pt'), TRAIN_ROWS)
     identity = None
     if args.identity_updates and not args.resume:  # the identity-path phase, built and captured before the timer
         identity = IdentityPhase(training.numpy(), args.identity_schedule or args.identity_updates, device, rank, world,
@@ -3989,7 +3996,7 @@ def train_stages(args, settings, device, rank, world):
                           peak_cuda_gb=round(torch.cuda.max_memory_allocated()/1e9, 3))
             if args.eval_every and step % args.eval_every == 0 and step < steps:
                 pause = time.perf_counter()
-                record['val_loss'] = evaluate(model.state_dict(), args.data_dir)
+                record['val_loss'] = validation_loss(model.state_dict(), args.data_dir)
                 paused += time.perf_counter()-pause
             if rank == 0:
                 print(json.dumps(record), flush=True)
@@ -4017,7 +4024,7 @@ def train_stages(args, settings, device, rank, world):
         if means:  # the end merge, timed with the training (the plain weights' validation is not)
             plain = {name: value.detach().cpu() for name, value in model.state_dict().items()}
             pause = time.perf_counter()
-            extra['val_loss_plain'] = evaluate(plain, args.data_dir)
+            extra['val_loss_plain'] = validation_loss(plain, args.data_dir)
             paused += time.perf_counter()-pause
             merge_start = time.perf_counter()
             extra.update(end_merge(model, means, holdout_rows, rank, world))
@@ -4028,13 +4035,14 @@ def train_stages(args, settings, device, rank, world):
                 torch.save(plain, args.output/'final_plain.pt')
             means = None
         state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
-        result = dict(val_loss=evaluate(state, args.data_dir), train_seconds=round(elapsed, 2), steps=stop,
+        result = dict(val_loss=validation_loss(state, args.data_dir), train_seconds=round(elapsed, 2), steps=stop,
                       seqs=end, tokens=end*settings.model.sequence_len, estimator=settings.estimator,
                       peak_cuda_gb=round(torch.cuda.max_memory_allocated()/1e9, 3), **extra)
         if rank == 0:
             torch.save(state, args.output/'final.pt')
             (args.output/'result.json').write_text(json.dumps(result, indent=2)+'\n')
             print(json.dumps(result), flush=True)
+            noise_harness.submit(args.output/'final.pt')  # on Yukon: the clock stops, and the run with it
     finally:
         estimator.close()
         if log is not None:

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for torchrun in the harness tests: runs the script (the last argument) in one process.
+for argument; do script="$argument"; done
+exec python "$script"
