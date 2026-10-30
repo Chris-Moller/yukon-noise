@@ -34,9 +34,19 @@ so the same script runs in both places.
 ## How a run is scored
 
 A submission passes when its validation loss is at most 3.5, and its score is the training time.
-Runs are slightly noisy (about ±0.0015 in loss), so a run whose loss lands within 0.003 of the
-target is repeated, up to three runs; the mean loss then decides, and the score is the median time.
-The settings are in [`benchmark.json`](../benchmark.json).
+Runs are slightly noisy, so a run whose loss lands within 0.002 of the target is repeated, up to
+three runs; the mean loss then decides, and the score is the median time. The settings are in
+[`benchmark.json`](../benchmark.json).
+
+**Calibration** (October 29, 2026; 5 runs of the baseline on gpu-runner, Modal 8xH100 SXM):
+
+| | Median or mean | σ | Range |
+| --- | --- | --- | --- |
+| Training time (scored) | 499.79 s | 2.10 s | 498.98–504.04 s |
+| Validation loss | 3.49906 | 0.00079 | 3.49793–3.49979 |
+
+`baselineScore` is the median time. The gate's margin is twice σ of the loss, rounded up. The
+baseline itself averages 0.0009 under the target, so it, and any run as close, is repeated.
 
 ## The images
 

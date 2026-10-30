@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "name": "noise-speedrun",
+  "description": "Train Q Labs' fixed 37.7M-parameter transformer on 30M FineWeb tokens to validation loss 3.5 without backpropagation, as fast as possible on one 8xH100 node.",
+  "category": "Machine Learning",
+  "direction": "-",
+  "editablePaths": [
+    "train/speedrun/run.py"
+  ],
+  "setupCommand": [
+    "bash",
+    "-c",
+    "uv sync && uv run utils/prepare_data.py"
+  ],
+  "benchmarkCommand": [
+    "bash",
+    "-c",
+    "uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py && uv run yukon/local_score.py logs/speedrun/result.json"
+  ],
+  "scorePath": ".yukon/score.json",
+  "hardware": "Scored on one 8xH100 SXM node (gpu-runner's h100x8 on Modal); yukon/README.md says what is timed.",
+  "runner": {
+    "provider": "gpu",
+    "machine": "h100x8",
+    "image": "ghcr.io/chris-moller/yukon-noise-participant@sha256:6bb9676d169ee6636a46c4fdeab1d388cdcce3a33595c7a70bf8d4430ca25115",
+    "command": [
+      "python",
+      "/opt/noise/repo/yukon/harness/supervise.py",
+      "--entry",
+      "train/speedrun/run.py",
+      "--submission",
+      "/files/submission.tar.gz",
+      "--training-limit",
+      "1800"
+    ],
+    "output": {
+      "path": "/out/final.pt",
+      "maxBytes": 536870912
+    },
+    "verifier": {
+      "image": "ghcr.io/chris-moller/yukon-noise-verifier@sha256:7e23838d673f40637e5e05d8b49d104909454d82d2998d267d7eaec6b8b648cf",
+      "command": [
+        "python",
+        "/opt/noise/verifier/verify.py"
+      ],
+      "machine": "h100",
+      "timeoutSeconds": 900
+    },
+    "baselineScore": 499.79,
+    "gate": {
+      "metric": "val_loss",
+      "max": 3.5,
+      "margin": 0.002,
+      "maxRuns": 3
+    }
+  }
+}
